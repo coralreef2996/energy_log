@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'main.dart';
 
 class LoginScreen extends StatefulWidget {
   final String appName;
@@ -153,14 +154,13 @@ class _LoginScreenState extends State<LoginScreen> {
                     ),
                   ),
                   onPressed: () {
-                    // 各画面へ遷移
+                    // HPDisplayPage へ直接遷移
                     Navigator.pushReplacement(
                       context,
                       MaterialPageRoute(
-                        builder: (context) => PlaceholderScreen(
-                          appName: widget.appName,
+                        builder: (context) => HPDisplayPage(
+                          pageType: 'HP',
                           isAdmin: isAdmin,
-                          originalHome: widget.originalHome,
                         ),
                       ),
                     );

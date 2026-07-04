@@ -5,10 +5,21 @@ import 'package:fl_chart/fl_chart.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart' as p;
 import 'dart:async';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:timezone/data/latest_all.dart' as tz;
+import 'package:timezone/timezone.dart' as tz;
+import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:google_fonts/google_fonts.dart';
+import 'package:flutter/services.dart';
 import 'login_screen.dart';
 
 // アプリの開始地点（メイン関数）です
-void main() {
+final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await NotificationHelper.init();
+  await NotificationHelper.scheduleHealthChecks();
   runApp(const MyApp());
 }
 
@@ -19,10 +30,19 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: '体力表示',
+      navigatorKey: navigatorKey,
+      title: '体調記録',
+      localizationsDelegates: const [
+        GlobalMaterialLocalizations.delegate,
+        GlobalWidgetsLocalizations.delegate,
+        GlobalCupertinoLocalizations.delegate,
+      ],
+      supportedLocales: const [Locale('ja', 'JP')],
+      locale: const Locale('ja', 'JP'),
       // アプリ全体のデザイン（テーマ）を設定します
       theme: ThemeData(
         primarySwatch: Colors.blue,
+        textTheme: GoogleFonts.notoSansJpTextTheme(Theme.of(context).textTheme),
         // ヘッダー（AppBar）のデザイン設定
         appBarTheme: const AppBarTheme(
           backgroundColor: Colors.white,
@@ -42,7 +62,8 @@ class MyApp extends StatelessWidget {
 // 数値が変わる画面を定義します（StatefulWidget）
 class HPDisplayPage extends StatefulWidget {
   final String pageType; // HP / MP / LP のどれを表示するかを受け取ります
-  const HPDisplayPage({super.key, required this.pageType});
+  final bool isAdmin; // 管理者モードで開始するかどうか
+  const HPDisplayPage({super.key, required this.pageType, this.isAdmin = false});
 
   @override
   State<HPDisplayPage> createState() => _HPDisplayPageState();
@@ -50,6 +71,15 @@ class HPDisplayPage extends StatefulWidget {
 
 // 画面の状態（データ）を管理する実体です
 class _HPDisplayPageState extends State<HPDisplayPage> {
+  static _HPDisplayPageState? activeInstance;
+
+  static void triggerConditionDialog() {
+    final context = navigatorKey.currentContext;
+    if (context != null) {
+      showConditionDialog(context);
+    }
+  }
+
   // --- システム全体で共有するデータ（static） ---
   // HP、MP、LPの現在の数値（0〜100）
   static double currentHP = 80.0;
@@ -67,17 +97,22 @@ class _HPDisplayPageState extends State<HPDisplayPage> {
     const Duration(minutes: 27),
   );
 
-  // --- 1時間ごとHP通知用タイマー ---
-  Timer? _hourlyTimer;        // 定期チェック用タイマー
-  int? _lastNotifiedHour;     // 最後に通知した「時」（二重表示防止）
+  // --- 30分ごとHP通知用タイマー ---
+  Timer? _hourlyTimer; // 定期チェック用タイマー
+  String? _lastNotifiedSlot; // 最後に通知した時間帯スロット (例: "15:30")
+  bool _isAdminMode = false; // 管理者モードフラグ
 
   @override
   void initState() {
     super.initState();
+    _isAdminMode = widget.isAdmin;
+    activeInstance = this;
     // データベースから保存されたデータを取り込みます
     _loadFromDatabase();
     // 1時間ごとHP通知タイマーを開始
     _startHourlyNotification();
+    // アプリ起動時の通知チェック
+    NotificationHelper.checkAppLaunchNotification();
   }
 
   Future<void> _loadFromDatabase() async {
@@ -103,8 +138,8 @@ class _HPDisplayPageState extends State<HPDisplayPage> {
   // 1時間ごとHP通知ロジック
   // -------------------------------------------------------
 
-  /// 30秒ごとに端末時刻をチェックし、9〜15時の丁度（minute == 0）に
-  /// かつその「時」にまだ通知していない場合のみダイアログを表示する
+  /// 30秒ごとに端末時刻をチェックし、7〜23時の30分ごとのスロットに
+  /// まだ通知していない場合、ダイアログを表示する
   void _startHourlyNotification() {
     _hourlyTimer = Timer.periodic(const Duration(seconds: 30), (_) {
       if (!mounted) return;
@@ -112,103 +147,36 @@ class _HPDisplayPageState extends State<HPDisplayPage> {
       final hour = now.hour;
       final minute = now.minute;
 
-      // 対象時間帯: 9時〜15時（9,10,11,12,13,14,15）
-      final isTargetHour = hour >= 9 && hour <= 15;
-      // 丁度（0分）かどうか
-      final isOnTheHour = minute == 0;
-      // 同じ時間帯にすでに通知済みでないか
-      final alreadyNotified = _lastNotifiedHour == hour;
+      // 対象時間帯: デバッグ用に7時〜23時に変更
+      final isTargetHour = hour >= 7 && hour <= 23;
 
-      if (isTargetHour && isOnTheHour && !alreadyNotified) {
-        _lastNotifiedHour = hour;
-        _showConditionDialog();
+      // 30分単位のスロットID (例: 15:00〜15:29 は "15:0", 15:30〜15:59 は "15:30")
+      final slotMinute = minute < 30 ? 0 : 30;
+      final slotId = '$hour:$slotMinute';
+
+      // すでにこのスロットで通知済みでないか
+      final alreadyNotified = _lastNotifiedSlot == slotId;
+
+      // デバッグ用のログを出力
+      debugPrint(
+        '【体調チェックタイマー監視】時刻: $hour時$minute分 (スロット: $slotId), 対象時間内: $isTargetHour, このスロットで通知済み: $alreadyNotified',
+      );
+
+      if (isTargetHour && !alreadyNotified) {
+        debugPrint('【体調チェックダイアログ表示実行】スロット: $slotId');
+        _lastNotifiedSlot = slotId;
+        final context = navigatorKey.currentContext;
+        if (context != null) {
+          showConditionDialog(context);
+        }
       }
     });
   }
 
-  /// 調子確認ダイアログを表示する
-  void _showConditionDialog() {
-    showDialog(
-      context: context,
-      barrierDismissible: false, // 必ずボタンを選んで閉じる
-      builder: (ctx) {
-        return AlertDialog(
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
-          ),
-          title: const Row(
-            children: [
-              Icon(Icons.favorite, color: Color(0xFF00FFFF)),
-              SizedBox(width: 8),
-              Text(
-                '今の調子はどうですか？',
-                style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
-              ),
-            ],
-          ),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              _conditionButton(ctx, '😢 悪い',       const Color(0xFFEF5350), -5.0),
-              const SizedBox(height: 8),
-              _conditionButton(ctx, '😟 少し悪い',   const Color(0xFFFF8A65), -3.0),
-              const SizedBox(height: 8),
-              _conditionButton(ctx, '😐 普通',        const Color(0xFF90A4AE),  0.0),
-              const SizedBox(height: 8),
-              _conditionButton(ctx, '😊 少し良い',   const Color(0xFF66BB6A), 3.0),
-              const SizedBox(height: 8),
-              _conditionButton(ctx, '😄 良い',        const Color(0xFF42A5F5), 5.0),
-            ],
-          ),
-        );
-      },
-    );
-  }
-
-  /// ダイアログ内の各選択ボタンを生成する
-  Widget _conditionButton(BuildContext ctx, String label, Color color, double delta) {
-    return SizedBox(
-      width: double.infinity,
-      child: ElevatedButton(
-        style: ElevatedButton.styleFrom(
-          backgroundColor: color,
-          foregroundColor: Colors.white,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(10),
-          ),
-          padding: const EdgeInsets.symmetric(vertical: 12),
-        ),
-        onPressed: () {
-          Navigator.of(ctx).pop(); // ダイアログを閉じる
-          _applyConditionChange(delta);
-        },
-        child: Text(
-          label,
-          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
-        ),
-      ),
-    );
-  }
-
-  /// HP値を delta だけ増減してデータベースへ保存する
-  Future<void> _applyConditionChange(double delta) async {
-    if (delta == 0.0) return; // 「普通」の場合は変化なし
-
-    final double newValue = (currentHP + delta).clamp(0.0, maxValue);
-
-    final db = DatabaseHelper.instance;
-    await db.saveStatus('HP', newValue);
-
-    final label = delta > 0 ? '+${delta.toInt()}' : '${delta.toInt()}';
-    final newHistoryItem = {
-      'datetime': DateTime.now(),
-      'episode': '調子チェック（$label%）',
-      'change': delta,
-    };
-    await db.insertHistory('HP', newHistoryItem);
-
-    final updatedHistory = await db.getHistory('HP');
-
+  void updateHPState(
+    double newValue,
+    List<Map<String, dynamic>> updatedHistory,
+  ) {
     if (!mounted) return;
     setState(() {
       currentHP = newValue;
@@ -491,7 +459,7 @@ class _HPDisplayPageState extends State<HPDisplayPage> {
       case 'LP':
         return '運勢表示';
       default:
-        return '体力表示';
+        return '体調記録';
     }
   }
 
@@ -765,6 +733,24 @@ class _HPDisplayPageState extends State<HPDisplayPage> {
       backgroundColor: Colors.transparent, // 背景を透明にして下のグラデーションを見せます
       appBar: AppBar(
         title: Text(getTitle()), // ページ名に合わせたタイトルを表示
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.notifications_active, color: Colors.blue),
+            onPressed: () async {
+              await NotificationHelper.scheduleTestNotification();
+              if (context.mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text(
+                      '10\u79d2\u5f8c\u306e\u30c6\u30b9\u30c8\u901a\u77e5\u3092\u30b9\u30b1\u30b8\u30e5\u30fc\u30eb\u3057\u307e\u3057\u305f\u3002',
+                    ), // 「10秒後のテスト通知をスケジュールしました。」
+                    duration: Duration(seconds: 3),
+                  ),
+                );
+              }
+            },
+          ),
+        ],
       ),
       body: Container(
         width: double.infinity,
@@ -1076,6 +1062,120 @@ class _HPDisplayPageState extends State<HPDisplayPage> {
                 const SizedBox(height: 10),
                 // 更新順に並び替えて、一人ずつリストとして表示します
                 ...getSortedUsers().map((user) => buildOtherUserHP(user)),
+                if (_isAdminMode) ...[
+                  const SizedBox(height: 25),
+                  const Divider(thickness: 2, color: Colors.blueGrey),
+                  const SizedBox(height: 10),
+                  const Text(
+                    '\u7ba1\u7406\u8005\u5c02\u7528\u30e1\u30cb\u30e5\u30fc', // 「管理者専用メニュー」
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.blueGrey,
+                    ),
+                  ),
+                  const SizedBox(height: 15),
+                  _adminMenuButton(
+                    context,
+                    Icons.warning_amber_rounded,
+                    Colors.red,
+                    '\u4f53\u8abf\u4f4e\u4e0b\u30a2\u30e9\u30fc\u30c8\u30ea\u30b9\u30c8', // 「体調低下アラートリスト」
+                    () => _showAdminAlertList(context),
+                  ),
+                  const SizedBox(height: 10),
+                  _adminMenuButton(
+                    context,
+                    Icons.group_work_outlined,
+                    Colors.teal,
+                    '\u30b0\u30eb\u30fc\u30d7\u5225\u6bd4\u8f03\u5206\u6790', // 「グループ別比較分析」
+                    () => _showAdminGroupComparison(context),
+                  ),
+                  const SizedBox(height: 10),
+                  _adminMenuButton(
+                    context,
+                    Icons.analytics_outlined,
+                    Colors.purple,
+                    '\u8981\u56e0\u30a8\u30d4\u30bd\u30fc\u30c9\u5206\u6790', // 「要因エピソード分析」
+                    () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (context) => EpisodeAnalysisPage(
+                            hpHistory: hpEpisodeHistory,
+                            otherUsers: otherUsers,
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                  const SizedBox(height: 10),
+                  _adminMenuButton(
+                    context,
+                    Icons.question_answer_outlined,
+                    Colors.indigo,
+                    '\u30ab\u30b9\u30bf\u30e0\u8cea\u554f\u4f5c\u6210\u30fb\u914d\u4fe1', // 「カスタム質問作成・配信」
+                    () async {
+                      final result = await Navigator.push<Map<String, dynamic>>(
+                        context,
+                        MaterialPageRoute(
+                          builder: (context) => const CustomQuestionEditPage(),
+                        ),
+                      );
+                      if (result != null) {
+                        final action = result['action'] as String;
+                        final question = result['question'] as String;
+                        final options = List<Map<String, dynamic>>.from(result['options'] as List);
+                        final time = result['time'] as String;
+
+                        if (action == 'save') {
+                          if (context.mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text('\u30a2\u30f3\u30b1\u30fc\u30c8\u3092\u4fdd\u5b58\u3057\u307e\u3057\u305f\u3002'), // 「アンケートを保存しました。」
+                                duration: Duration(seconds: 2),
+                              ),
+                            );
+                          }
+                        } else if (action == 'deliver') {
+                          Future.delayed(const Duration(milliseconds: 1500), () {
+                            if (context.mounted) {
+                              _showCustomSurveyDialog(context, question, options);
+                            }
+                          });
+                          if (context.mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              SnackBar(
+                                content: Text('$time \u306b\u30a2\u30f3\u30b1\u30fc\u30c8\u3092\u914d\u4fe1\u3057\u307e\u3059\u3002(\u30c6\u30b9\u30c8\u7528\u306b1.5\u79d2\u5f8c\u306e\u901a\u77e5)'), // 「XX:XXにアンケートを配信します。(テスト用に1.5秒後の通知)」
+                                duration: const Duration(seconds: 2),
+                              ),
+                            );
+                          }
+                        }
+                      }
+                    },
+                  ),
+                  const SizedBox(height: 10),
+                  _adminMenuButton(
+                    context,
+                    Icons.download_outlined,
+                    Colors.green,
+                    '\u30c7\u30fc\u30bf\u30a8\u30af\u30b9\u30dd\u30fc\u30c8(CSV/PDF)', // 「データエクスポート(CSV/PDF)」
+                    () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (context) => DataExportPage(
+                            hpHistory: hpEpisodeHistory,
+                            mpHistory: mpEpisodeHistory,
+                            lpHistory: lpEpisodeHistory,
+                            otherUsers: otherUsers,
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                  const SizedBox(height: 20),
+                ],
               ],
             ),
           ),
@@ -1083,6 +1183,232 @@ class _HPDisplayPageState extends State<HPDisplayPage> {
       ),
     );
   }
+
+  Widget _adminMenuButton(
+    BuildContext context,
+    IconData icon,
+    Color color,
+    String label,
+    VoidCallback onPressed,
+  ) {
+    return SizedBox(
+      width: double.infinity,
+      child: ElevatedButton.icon(
+        onPressed: onPressed,
+        icon: Icon(icon, color: Colors.white),
+        label: Text(
+          label,
+          style: const TextStyle(fontWeight: FontWeight.bold),
+        ),
+        style: ElevatedButton.styleFrom(
+          backgroundColor: color,
+          foregroundColor: Colors.white,
+          padding: const EdgeInsets.symmetric(vertical: 14),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(10),
+          ),
+          elevation: 2,
+        ),
+      ),
+    );
+  }
+
+  void _showAdminAlertList(BuildContext context) {
+    final double myHP = currentHP;
+    final List<Map<String, dynamic>> alerts = [
+      if (myHP < 30.0) {'name': '\u81ea\u5206', 'hp': myHP, 'reason': '\u767a\u751f\u4e2d\u306e\u4e0d\u8abf'}, // 「自分」「発生中の不調」
+      {'name': '\u5c71\u7530\u592a\u90ce', 'hp': 25.0, 'reason': '\u9023\u65e5\u306e\u6b8b\u696d\u306b\u3088\u308b\u75b2\u52b4'}, // 「山田太郎」「連日の残業による疲労」
+      {'name': '\u4f50\u85e4\u82b1\u5b50', 'hp': 18.0, 'reason': '\u7761\u7720\u4e0d\u8db3\u3068\u982d\u75db'}, // 「佐藤花子」「睡眠不足と頭痛」
+      {'name': '\u9234\u6728\u4e00\u90ce', 'hp': 29.0, 'reason': '\u7dca\u5f35\u72b6\u614b\u306e\u7d2f\u7a4d'}, // 「鈴木一郎」「緊張状態の累積」
+    ];
+
+    showDialog(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          title: const Text(
+            '\u4f53\u8abf\u4f4e\u4e0b\u30a2\u30e9\u30fc\u30c8\u30ea\u30b9\u30c8 (HP < 30%)', // 「体調低下アラートリスト」
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+          ),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: ListView.builder(
+              shrinkWrap: true,
+              itemCount: alerts.length,
+              itemBuilder: (c, idx) {
+                final item = alerts[idx];
+                return ListTile(
+                  leading: const Icon(Icons.warning, color: Colors.red),
+                  title: Text('${item['name']} (HP: ${item['hp']}%)'),
+                  subtitle: Text(item['reason'] as String),
+                );
+              },
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('OK'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+
+
+  void _showAdminGroupComparison(BuildContext context) {
+    final List<Map<String, dynamic>> groups = [
+      {'name': '\u958b\u767a\u30c1\u30fc\u30e0', 'hp': 75.0, 'mp': 65.0, 'lp': 80.0}, // 「開発チーム」
+      {'name': '\u55b6\u696d\u30c1\u30fc\u30e0', 'hp': 58.0, 'mp': 42.0, 'lp': 55.0}, // 「営業チーム」
+      {'name': '\u4f5c\u696d\u73fe\u5834', 'hp': 82.0, 'mp': 78.0, 'lp': 88.0}, // 「作業現場」
+    ];
+
+    showDialog(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          title: const Text(
+            '\u30b0\u30eb\u30fc\u30d7\u5225\u6bd4\u8f03\u5206\u6790 (\u5e73\u5747)', // 「グループ別比較分析（平均）」
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+          ),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: ListView.builder(
+              shrinkWrap: true,
+              itemCount: groups.length,
+              itemBuilder: (c, idx) {
+                final group = groups[idx];
+                return Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(group['name'] as String, style: const TextStyle(fontWeight: FontWeight.bold)),
+                      const SizedBox(height: 4),
+                      Row(
+                        children: [
+                          const Text('HP: ', style: TextStyle(fontSize: 11)),
+                          Expanded(
+                            child: LinearProgressIndicator(
+                              value: group['hp'] / 100.0,
+                              color: Colors.red,
+                              backgroundColor: Colors.grey[200],
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Text('${group['hp']}%', style: const TextStyle(fontSize: 11)),
+                        ],
+                      ),
+                      Row(
+                        children: [
+                          const Text('MP: ', style: TextStyle(fontSize: 11)),
+                          Expanded(
+                            child: LinearProgressIndicator(
+                              value: group['mp'] / 100.0,
+                              color: Colors.blue,
+                              backgroundColor: Colors.grey[200],
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Text('${group['mp']}%', style: const TextStyle(fontSize: 11)),
+                        ],
+                      ),
+                      const Divider(),
+                    ],
+                  ),
+                );
+              },
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('OK'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+
+
+  void _showCustomSurveyDialog(
+    BuildContext context,
+    String question,
+    List<Map<String, dynamic>> options,
+  ) {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        return AlertDialog(
+          title: const Text('\u30a2\u30f3\u30b1\u30fc\u30c8\u56de\u7b54'), // 「アンケート回答」
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(question, style: const TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 15),
+              ...options.map((opt) {
+                final String text = opt['text'] as String;
+                final double value = (opt['value'] as num).toDouble();
+                final String sign = value >= 0 ? '+' : '';
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 8.0),
+                  child: SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton(
+                      onPressed: () async {
+                        Navigator.pop(ctx);
+                        final String type = widget.pageType;
+                        
+                        if (type == 'HP') {
+                          currentHP = (currentHP + value).clamp(0.0, 100.0);
+                        } else if (type == 'MP') {
+                          currentMP = (currentMP + value).clamp(0.0, 100.0);
+                        } else if (type == 'LP') {
+                          currentLP = (currentLP + value).clamp(0.0, 100.0);
+                        }
+
+                        final db = DatabaseHelper.instance;
+                        await db.saveStatus(type.toLowerCase(), type == 'HP' ? currentHP : (type == 'MP' ? currentMP : currentLP));
+                        
+                        final int cleanChange = value.round();
+                        final newHistoryItem = {
+                          'datetime': DateTime.now().toIso8601String(),
+                          'episode': '\u30a2\u30f3\u30b1\u30fc\u30c8\u56de\u7b54: $text', // 「アンケート回答: [選択肢名]」
+                          'change': cleanChange,
+                        };
+                        await db.insertHistory(type, newHistoryItem);
+
+                        _loadFromDatabase();
+
+                        if (context.mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                '\u30a2\u30f3\u30b1\u30fc\u30c8\u56de\u7b54\u3092\u9069\u7528\u3057\u307e\u3057\u305f\u3002($type $sign$cleanChange%)', // 「アンケート回答を適用しました。(HP +5%)」
+                              ),
+                            ),
+                          );
+                        }
+                      },
+                      child: Text('$text ($sign${value.toStringAsFixed(0)}%)'),
+                    ),
+                  ),
+                );
+              }),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+
 
   // --- タブボタン単体を作る関数 ---
   Widget _buildTabButton(String label) {
@@ -1094,7 +1420,7 @@ class _HPDisplayPageState extends State<HPDisplayPage> {
           Navigator.pushReplacement(
             context,
             MaterialPageRoute(
-              builder: (context) => HPDisplayPage(pageType: label),
+              builder: (context) => HPDisplayPage(pageType: label, isAdmin: _isAdminMode),
             ),
           );
         }
@@ -1114,6 +1440,9 @@ class _HPDisplayPageState extends State<HPDisplayPage> {
 
   @override
   void dispose() {
+    if (activeInstance == this) {
+      activeInstance = null;
+    }
     // タイマーのキャンセル
     _hourlyTimer?.cancel();
     // コントローラーのメモリ解放
@@ -2479,5 +2808,1418 @@ class DatabaseHelper {
   Future<void> deleteHistory(int id) async {
     final db = await database;
     await db.delete('history', where: 'id = ?', whereArgs: [id]);
+  }
+}
+
+// --- 端末ローカル通知を管理するヘルパークラス ---
+class NotificationHelper {
+  static final FlutterLocalNotificationsPlugin _notificationsPlugin =
+      FlutterLocalNotificationsPlugin();
+
+  static Future<void> init() async {
+    // タイムゾーンの初期化（日本時間 Asia/Tokyo 固定）
+    tz.initializeTimeZones();
+    tz.setLocalLocation(tz.getLocation('Asia/Tokyo'));
+
+    // Android用初期化設定
+    const AndroidInitializationSettings initializationSettingsAndroid =
+        AndroidInitializationSettings('@mipmap/ic_launcher');
+
+    // iOS用初期化設定
+    const DarwinInitializationSettings initializationSettingsDarwin =
+        DarwinInitializationSettings(
+          requestAlertPermission: true,
+          requestBadgePermission: true,
+          requestSoundPermission: true,
+        );
+
+    const InitializationSettings initializationSettings =
+        InitializationSettings(
+          android: initializationSettingsAndroid,
+          iOS: initializationSettingsDarwin,
+        );
+
+    await _notificationsPlugin.initialize(
+      settings: initializationSettings,
+      onDidReceiveNotificationResponse: (NotificationResponse response) {
+        debugPrint('【ローカル通知タップ検知】レスポンス: ${response.payload}');
+        _HPDisplayPageState.triggerConditionDialog();
+      },
+    );
+
+    // Android用の通知チャンネル登録と権限要求
+    final androidImplementation = _notificationsPlugin
+        .resolvePlatformSpecificImplementation<
+          AndroidFlutterLocalNotificationsPlugin
+        >();
+    if (androidImplementation != null) {
+      const AndroidNotificationChannel channel = AndroidNotificationChannel(
+        'health_check_channel_v2',
+        '\u4f53\u8abf\u8a18\u9332\u901a\u77e5', // 「体調記録通知」
+        description:
+            '\u5b9a\u6642\u4f53\u8abf\u5165\u529b\u306e\u30ea\u30de\u30a4\u30f3\u30c0\u30fc\u901a\u77e5', // 「定時体調入力のリマインダー通知」
+        importance: Importance.max,
+      );
+      await androidImplementation.createNotificationChannel(channel);
+      await androidImplementation.requestNotificationsPermission();
+      await androidImplementation.requestExactAlarmsPermission();
+    }
+  }
+
+  /// アプリ起動時に通知タップによる起動か確認
+  static Future<void> checkAppLaunchNotification() async {
+    final details = await _notificationsPlugin
+        .getNotificationAppLaunchDetails();
+    if (details?.didNotificationLaunchApp ?? false) {
+      debugPrint('【ローカル通知】通知タップによりアプリが起動されました。');
+      Future.delayed(const Duration(milliseconds: 600), () {
+        _HPDisplayPageState.triggerConditionDialog();
+      });
+    }
+  }
+
+  /// スケジュール通知の生成・最新化
+  static Future<void> scheduleHealthChecks() async {
+    // 既存のスケジュール通知をクリア
+    await _notificationsPlugin.cancelAll();
+
+    const AndroidNotificationDetails
+    androidDetails = AndroidNotificationDetails(
+      'health_check_channel_v2',
+      '\u4f53\u8abf\u8a18\u9332\u901a\u77e5', // 「体調記録通知」
+      channelDescription:
+          '\u5b9a\u6642\u4f53\u8abf\u5165\u529b\u306e\u30ea\u30de\u30a4\u30f3\u30c0\u30fc\u901a\u77e5', // 「定時体調入力のリマインダー通知」
+      importance: Importance.max,
+      priority: Priority.max,
+      category: AndroidNotificationCategory.alarm,
+    );
+
+    const NotificationDetails notificationDetails = NotificationDetails(
+      android: androidDetails,
+      iOS: DarwinNotificationDetails(),
+    );
+
+    final now = tz.TZDateTime.now(tz.local);
+    debugPrint(
+      '【スケジュール登録】現在時刻 JST: ${now.toString()}, タイムゾーン: ${tz.local.name}',
+    );
+    int notificationId = 0;
+
+    // 今日、明日、明後日の3日間分をスケジュールする
+    for (int dayOffset = 0; dayOffset < 3; dayOffset++) {
+      final targetDate = now.add(Duration(days: dayOffset));
+
+      // 10時から15時まで、1時間ごと（00分）の時刻
+      for (int hour = 10; hour <= 15; hour++) {
+        for (int minute in [0]) {
+          final scheduledDate = tz.TZDateTime(
+            tz.local,
+            targetDate.year,
+            targetDate.month,
+            targetDate.day,
+            hour,
+            minute,
+          );
+
+          // 未来の時刻のみスケジュール
+          if (scheduledDate.isAfter(now)) {
+            try {
+              await _notificationsPlugin.zonedSchedule(
+                id: notificationId++,
+                title: '\u4f53\u8abf\u8a18\u9332', // 「体調記録」
+                body:
+                    '\u4eca\u306e\u4f53\u8abf\u306f\u3069\u3046\u3067\u3059\u304b\uff1f', // 「今の体調はどうですか？」
+                scheduledDate: scheduledDate,
+                notificationDetails: notificationDetails,
+                androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+              );
+              debugPrint(
+                '【通知スケジュール成功】ID: ${notificationId - 1}, 予定時刻 JST: ${scheduledDate.toString()}',
+              );
+            } catch (e) {
+              await _notificationsPlugin.zonedSchedule(
+                id: notificationId++,
+                title: '\u4f53\u8abf\u8a18\u9332', // 「体調記録」
+                body:
+                    '\u4eca\u306e\u4f53\u8abf\u306f\u3069\u3046\u3067\u3059\u304b\uff1f', // 「今の体調はどうですか？」
+                scheduledDate: scheduledDate,
+                notificationDetails: notificationDetails,
+                androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+              );
+              debugPrint(
+                '【通知スケジュールフォールバック】ID: ${notificationId - 1}, 予定時刻 JST: ${scheduledDate.toString()}',
+              );
+            }
+          }
+        }
+      }
+    }
+    debugPrint('【ローカル通知】合計 $notificationId 件の通知をスケジュールしました。');
+  }
+
+  /// テスト用の10秒後通知スケジュール関数
+  static Future<void> scheduleTestNotification() async {
+    final now = tz.TZDateTime.now(tz.local);
+    final scheduledDate = now.add(const Duration(seconds: 10));
+
+    const AndroidNotificationDetails
+    androidDetails = AndroidNotificationDetails(
+      'health_check_channel_v2',
+      '\u4f53\u8abf\u8a18\u9332\u901a\u77e5',
+      channelDescription:
+          '\u5b9a\u6642\u4f53\u8abf\u5165\u529b\u306e\u30ea\u30de\u30a4\u30f3\u30c0\u30fc\u901a\u77e5',
+      importance: Importance.max,
+      priority: Priority.max,
+      category: AndroidNotificationCategory.alarm,
+    );
+
+    await _notificationsPlugin.zonedSchedule(
+      id: 9999,
+      title:
+          '\u3010\u30c6\u30b9\u30c8\u3011\u4f53\u8abf\u8a18\u9332', // 「【テスト】体調記録」
+      body:
+          '10\u79d2\u5f8c\u306e\u30c6\u30b9\u30c8\u901a\u77e5\u3067\u3059\u3002', // 「10秒後のテスト通知です。」
+      scheduledDate: scheduledDate,
+      notificationDetails: const NotificationDetails(
+        android: androidDetails,
+        iOS: DarwinNotificationDetails(),
+      ),
+      androidScheduleMode: AndroidScheduleMode.exactAllowWhileIdle,
+    );
+    debugPrint('【テスト通知スケジュール】10秒後にスケジュール登録完了 JST: ${scheduledDate.toString()}');
+  }
+}
+
+// --- 統一された体調確認ダイアログの表示ヘルパー ---
+void showConditionDialog(BuildContext context) {
+  showDialog(
+    context: context,
+    barrierDismissible: false, // 必ずボタンを選んで閉じる
+    builder: (ctx) {
+      return AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Row(
+          children: [
+            Icon(Icons.favorite, color: Color(0xFF00FFFF)),
+            SizedBox(width: 8),
+            Text(
+              '\u4eca\u306e\u4f53\u8abf\u306f\u3069\u3046\u3067\u3059\u304b\uff1f', // 「今の体調はどうですか？」
+              style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
+            ),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _conditionButtonGlobal(
+              ctx,
+              '\u826f\u3044',
+              const Color(0xFFE53935),
+              5.0,
+            ), // 良い (赤)
+            const SizedBox(height: 8),
+            _conditionButtonGlobal(
+              ctx,
+              '\u5c11\u3057\u826f\u3044',
+              const Color(0xFFD81B60),
+              3.0,
+            ), // 少し良い (マゼンタ)
+            const SizedBox(height: 8),
+            _conditionButtonGlobal(
+              ctx,
+              '\u666e\u901a',
+              const Color(0xFF90A4AE),
+              0.0,
+            ), // 普通 (ブルーグレー)
+            const SizedBox(height: 8),
+            _conditionButtonGlobal(
+              ctx,
+              '\u5c11\u3057\u60aa\u3044',
+              const Color(0xFF5E35B1),
+              -3.0,
+            ), // 少し悪い (青紫)
+            const SizedBox(height: 8),
+            _conditionButtonGlobal(
+              ctx,
+              '\u60aa\u3044',
+              const Color(0xFF311B92),
+              -5.0,
+            ), // 悪い (暗い紫)
+          ],
+        ),
+      );
+    },
+  );
+}
+
+Widget _conditionButtonGlobal(
+  BuildContext ctx,
+  String label,
+  Color color,
+  double delta,
+) {
+  return SizedBox(
+    width: double.infinity,
+    child: ElevatedButton(
+      style: ElevatedButton.styleFrom(
+        backgroundColor: color,
+        foregroundColor: Colors.white,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+        padding: const EdgeInsets.symmetric(vertical: 12),
+      ),
+      onPressed: () {
+        Navigator.of(ctx).pop(); // ダイアログを閉じる
+        _applyConditionChangeGlobal(delta);
+      },
+      child: Text(
+        label,
+        style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
+      ),
+    ),
+  );
+}
+
+/// グローバルなHP更新・履歴追加関数
+Future<void> _applyConditionChangeGlobal(double delta) async {
+  final double currentHP = _HPDisplayPageState.currentHP;
+  final double newValue = (currentHP + delta).clamp(0.0, 100.0);
+
+  final db = DatabaseHelper.instance;
+  await db.saveStatus('HP', newValue);
+
+  final newHistoryItem = {
+    'datetime': DateTime.now(),
+    'episode': '\u5b9a\u6642\u5165\u529b', // 「定時入力」
+    'change': delta,
+  };
+  await db.insertHistory('HP', newHistoryItem);
+
+  final updatedHistory = await db.getHistory('HP');
+
+  if (_HPDisplayPageState.activeInstance != null &&
+      _HPDisplayPageState.activeInstance!.mounted) {
+    _HPDisplayPageState.activeInstance!.updateHPState(newValue, updatedHistory);
+  } else {
+    _HPDisplayPageState.currentHP = newValue;
+    _HPDisplayPageState.hpEpisodeHistory = updatedHistory;
+  }
+}
+
+
+// ============================================================================
+// CustomQuestionEditPage (カスタムアンケートの作成・一時ストック・再編集画面)
+// ============================================================================
+
+class CustomQuestionEditPage extends StatefulWidget {
+  const CustomQuestionEditPage({super.key});
+
+  @override
+  State<CustomQuestionEditPage> createState() => _CustomQuestionEditPageState();
+}
+
+class _CustomQuestionEditPageState extends State<CustomQuestionEditPage> {
+  final TextEditingController _questionController = TextEditingController();
+  
+  final TextEditingController _option1Controller = TextEditingController(text: '\u306f\u3044'); // 「はい」
+  final TextEditingController _option2Controller = TextEditingController(text: '\u3069\u3061\u3089\u3067\u3082\u306a\u3044'); // 「どちらでもない」
+  final TextEditingController _option3Controller = TextEditingController(text: '\u3044\u3044\u3048'); // 「いいえ」
+
+  final TextEditingController _value1Controller = TextEditingController(text: '5');
+  final TextEditingController _value2Controller = TextEditingController(text: '0');
+  final TextEditingController _value3Controller = TextEditingController(text: '-5');
+
+  TimeOfDay _selectedTime = const TimeOfDay(hour: 9, minute: 30);
+
+  // 保存されたアンケートの一時ストックリスト
+  final List<Map<String, dynamic>> _savedSurveys = [];
+
+  @override
+  void dispose() {
+    _questionController.dispose();
+    _option1Controller.dispose();
+    _option2Controller.dispose();
+    _option3Controller.dispose();
+    _value1Controller.dispose();
+    _value2Controller.dispose();
+    _value3Controller.dispose();
+    super.dispose();
+  }
+
+  Future<void> _pickTime() async {
+    final picked = await showTimePicker(
+      context: context,
+      initialTime: _selectedTime,
+    );
+    if (picked != null) {
+      setState(() {
+        _selectedTime = picked;
+      });
+    }
+  }
+
+  // フォームの内容を一時保存リストにストックする
+  void _saveSurveyLocally() {
+    final String questionText = _questionController.text.trim();
+    if (questionText.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            '\u8cea\u554f\u5185\u5bb9\u304c\u5165\u529b\u3055\u308c\u3066\u3044\u307e\u305b\u3093', // 「質問内容が入力されていません」
+          ),
+        ),
+      );
+      return;
+    }
+
+    final double val1 = double.tryParse(_value1Controller.text) ?? 5.0;
+    final double val2 = double.tryParse(_value2Controller.text) ?? 0.0;
+    final double val3 = double.tryParse(_value3Controller.text) ?? -5.0;
+    final String timeStr = '${_selectedTime.hour.toString().padLeft(2, '0')}:${_selectedTime.minute.toString().padLeft(2, '0')}';
+
+    setState(() {
+      _savedSurveys.add({
+        'question': questionText,
+        'options': [
+          {'text': _option1Controller.text.trim(), 'value': val1},
+          {'text': _option2Controller.text.trim(), 'value': val2},
+          {'text': _option3Controller.text.trim(), 'value': val3},
+        ],
+        'time': timeStr,
+      });
+
+      // フォームをクリアして初期化
+      _questionController.clear();
+      _option1Controller.text = '\u306f\u3044';
+      _option2Controller.text = '\u3069\u3061\u3089\u3067\u3082\u306a\u3044';
+      _option3Controller.text = '\u3044\u3044\u3048';
+      _value1Controller.text = '5';
+      _value2Controller.text = '0';
+      _value3Controller.text = '-5';
+      _selectedTime = const TimeOfDay(hour: 9, minute: 30);
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text(
+          '\u30a2\u30f3\u30b1\u30fc\u30c8\u3092\u4e00\u6642\u4fdd\u5b58\u3057\u307e\u3057\u305f', // 「アンケートを一時保存しました」
+        ),
+        duration: Duration(seconds: 2),
+      ),
+    );
+  }
+
+  // 入力フォームの現在の内容で直接配信する
+  void _deliverDirectly() {
+    final String questionText = _questionController.text.trim();
+    if (questionText.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            '\u8cea\u554f\u5185\u5bb9\u304c\u5165\u529b\u3055\u308c\u3066\u3044\u307e\u305b\u3093', // 「質問内容が入力されていません」
+          ),
+        ),
+      );
+      return;
+    }
+
+    final double val1 = double.tryParse(_value1Controller.text) ?? 5.0;
+    final double val2 = double.tryParse(_value2Controller.text) ?? 0.0;
+    final double val3 = double.tryParse(_value3Controller.text) ?? -5.0;
+    final String timeStr = '${_selectedTime.hour.toString().padLeft(2, '0')}:${_selectedTime.minute.toString().padLeft(2, '0')}';
+
+    Navigator.pop(context, {
+      'action': 'deliver',
+      'question': questionText,
+      'options': [
+        {'text': _option1Controller.text.trim(), 'value': val1},
+        {'text': _option2Controller.text.trim(), 'value': val2},
+        {'text': _option3Controller.text.trim(), 'value': val3},
+      ],
+      'time': timeStr,
+    });
+  }
+
+  // 保存済みリストのアイテムを再編集用に入力フォームに書き戻す
+  void _editSurvey(int index) {
+    final survey = _savedSurveys[index];
+    final options = survey['options'] as List;
+    
+    setState(() {
+      _questionController.text = survey['question'] as String;
+      
+      _option1Controller.text = options[0]['text'] as String;
+      _value1Controller.text = (options[0]['value'] as num).toStringAsFixed(0);
+
+      _option2Controller.text = options[1]['text'] as String;
+      _value2Controller.text = (options[1]['value'] as num).toStringAsFixed(0);
+
+      _option3Controller.text = options[2]['text'] as String;
+      _value3Controller.text = (options[2]['value'] as num).toStringAsFixed(0);
+
+      final parts = (survey['time'] as String).split(':');
+      _selectedTime = TimeOfDay(hour: int.parse(parts[0]), minute: int.parse(parts[1]));
+
+      // リストから一旦削除
+      _savedSurveys.removeAt(index);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final String timeLabel = '${_selectedTime.hour.toString().padLeft(2, '0')}:${_selectedTime.minute.toString().padLeft(2, '0')}';
+
+    return Scaffold(
+      backgroundColor: Colors.transparent,
+      appBar: AppBar(
+        title: const Text('\u30ab\u30b9\u30bf\u30e0\u8cea\u554f\u7de8\u96c6'), // 「カスタム質問編集」
+        centerTitle: true,
+      ),
+      body: Container(
+        width: double.infinity,
+        height: double.infinity,
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [
+              Color(0xFFFFFFFF),
+              Color(0xFFDFFFBF),
+            ],
+          ),
+        ),
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(20.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Card(
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                elevation: 4,
+                child: Padding(
+                  padding: const EdgeInsets.all(20.0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        '\u30a2\u30f3\u30b1\u30fc\u30c8\u4f5c\u6210', // 「アンケート作成」
+                        style: TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.indigo,
+                        ),
+                      ),
+                      const SizedBox(height: 20),
+                      const Text(
+                        '\u8cea\u554f\u5185\u5bb9', // 「質問内容」
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.grey,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: _questionController,
+                        maxLines: 2,
+                        decoration: InputDecoration(
+                          hintText: '\u4f53\u8abf\u3084\u75b2\u52b4\u306b\u95a2\u3059\u308b\u8cea\u554f\u3092\u5165\u529b\u3057\u3066\u306d', // 「体調や疲労に関する質問を入力してね」
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          filled: true,
+                          fillColor: Colors.grey[50],
+                        ),
+                      ),
+                      const SizedBox(height: 20),
+                      _buildOptionRow('\u9078\u629e\u80a21', _option1Controller, _value1Controller),
+                      const SizedBox(height: 16),
+                      _buildOptionRow('\u9078\u629e\u80a22', _option2Controller, _value2Controller),
+                      const SizedBox(height: 16),
+                      _buildOptionRow('\u9078\u629e\u80a23', _option3Controller, _value3Controller),
+                      const SizedBox(height: 24),
+                      
+                      // 投稿時刻設定
+                      const Text(
+                        '\u6295\u7a3f\u6642\u523b\u0020\u0028\u30d7\u30c3\u30b7\u30e5\u6642\u523b\u0029', // 「投稿時刻 (プッシュ時刻)」
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.grey,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                            decoration: BoxDecoration(
+                              color: Colors.grey[100],
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(color: Colors.grey[300]!),
+                            ),
+                            child: Text(
+                              timeLabel,
+                              style: const TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.indigo,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 12),
+                          ElevatedButton.icon(
+                            onPressed: _pickTime,
+                            icon: const Icon(Icons.access_time, size: 18),
+                            label: const Text('\u6642\u523b\u3092\u9078\u629e\u3059\u308b'), // 「時刻を選択する」
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.indigo.withAlpha(25),
+                              foregroundColor: Colors.indigo,
+                              elevation: 0,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 24),
+              // 保存ボタン（一時リストに追加）
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: _saveSurveyLocally,
+                  icon: const Icon(Icons.save_rounded, color: Colors.blueGrey),
+                  label: const Text(
+                    '\u4fdd\u5b58\u0020\u0028\u5b9f\u884c\u305b\u305a\u306b\u4fdd\u5b58\u3059\u308b\u0029', // 「保存 (実行せずに保存する)」
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                  ),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.blueGrey,
+                    side: const BorderSide(color: Colors.blueGrey, width: 1.5),
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 20),
+
+              // 一時保存リスト（アコーディオンタイル）の表示部分
+              if (_savedSurveys.isNotEmpty) ...[
+                const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 4, vertical: 8),
+                  child: Text(
+                    '\u4fdd\u5b58\u6e08\u307f\u30a2\u30f3\u30b1\u30fc\u30c8\u0020\u0028\u4e00\u6642\u30b9\u30c8\u30c3\u30af\u0029', // 「保存済みアンケート (一時ストック)」
+                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.blueGrey),
+                  ),
+                ),
+                ListView.builder(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  itemCount: _savedSurveys.length,
+                  itemBuilder: (context, idx) {
+                    final survey = _savedSurveys[idx];
+                    final listOptions = survey['options'] as List;
+                    return Card(
+                      margin: const EdgeInsets.only(bottom: 12),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      elevation: 2,
+                      child: ExpansionTile(
+                        leading: const Icon(Icons.description_outlined, color: Colors.indigo),
+                        title: Text(
+                          survey['question'] as String,
+                          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+                        ),
+                        subtitle: Text(
+                          '\u23f1\u0020\u6295\u7a3f\u0020${survey['time']}', // 「⏰ 投稿 XX:XX」
+                          style: const TextStyle(fontSize: 12, color: Colors.grey),
+                        ),
+                        children: [
+                          Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                const Divider(),
+                                ...listOptions.map((opt) {
+                                  final double val = (opt['value'] as num).toDouble();
+                                  final String sign = val >= 0 ? '+' : '';
+                                  return Padding(
+                                    padding: const EdgeInsets.symmetric(vertical: 2.0),
+                                    child: Row(
+                                      children: [
+                                        const Icon(Icons.circle, size: 6, color: Colors.indigo),
+                                        const SizedBox(width: 8),
+                                        Text(
+                                          '${opt['text']}: $sign${val.toStringAsFixed(0)}%',
+                                          style: const TextStyle(fontSize: 13, color: Colors.black87),
+                                        ),
+                                      ],
+                                    ),
+                                  );
+                                }),
+                                const SizedBox(height: 12),
+                                // アクションテキストボタン群（右下配置）
+                                Row(
+                                  mainAxisAlignment: MainAxisAlignment.end,
+                                  children: [
+                                    TextButton(
+                                      onPressed: () {
+                                        setState(() {
+                                          _savedSurveys.removeAt(idx);
+                                        });
+                                      },
+                                      child: const Text(
+                                        '\u524a\u9664', // 「削除」
+                                        style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    TextButton(
+                                      onPressed: () => _editSurvey(idx),
+                                      child: const Text(
+                                        '\u7de8\u96c6', // 「編集」
+                                        style: TextStyle(color: Colors.blueGrey, fontWeight: FontWeight.bold),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    TextButton(
+                                      onPressed: () {
+                                        Navigator.pop(context, {
+                                          'action': 'deliver',
+                                          'question': survey['question'] as String,
+                                          'options': survey['options'],
+                                          'time': survey['time'] as String,
+                                        });
+                                      },
+                                      child: const Text(
+                                        '\u914d\u4fe1', // 「配信」
+                                        style: TextStyle(color: Colors.indigo, fontWeight: FontWeight.bold),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              ],
+              const SizedBox(height: 12),
+
+              // 配信ボタン（現在のフォームの内容で即座に配信する用）
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  onPressed: _deliverDirectly,
+                  icon: const Icon(Icons.send_rounded, color: Colors.white),
+                  label: const Text(
+                    '\u30a2\u30f3\u30b1\u30fc\u30c8\u3092\u914d\u4fe1\u3059\u308b', // 「アンケートを配信する」
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                  ),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.indigo,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    elevation: 4,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildOptionRow(
+    String label,
+    TextEditingController textCtrl,
+    TextEditingController valCtrl,
+  ) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label,
+          style: const TextStyle(
+            fontSize: 14,
+            fontWeight: FontWeight.bold,
+            color: Colors.grey,
+          ),
+        ),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            Expanded(
+              flex: 3,
+              child: TextField(
+                controller: textCtrl,
+                decoration: InputDecoration(
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  filled: true,
+                  fillColor: Colors.grey[50],
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                ),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              flex: 1,
+              child: TextField(
+                controller: valCtrl,
+                keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true),
+                decoration: InputDecoration(
+                  suffixText: '%',
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  filled: true,
+                  fillColor: Colors.grey[50],
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+}
+
+
+// ============================================================================
+// DataExportPage (データ分析・エクスポート画面。ユーザー一覧切り替え、折れ線グラフ、CSVログ出力)
+// ============================================================================
+
+class DataExportPage extends StatefulWidget {
+  final List<Map<String, dynamic>> hpHistory;
+  final List<Map<String, dynamic>> mpHistory;
+  final List<Map<String, dynamic>> lpHistory;
+  final List<Map<String, dynamic>> otherUsers;
+
+  const DataExportPage({
+    super.key,
+    required this.hpHistory,
+    required this.mpHistory,
+    required this.lpHistory,
+    required this.otherUsers,
+  });
+
+  @override
+  State<DataExportPage> createState() => _DataExportPageState();
+}
+
+class _DataExportPageState extends State<DataExportPage> {
+  String _selectedUser = '\u81ea\u5206'; // 「自分」
+
+  // 選択されたユーザーに対応する履歴（HP, MP, LP）を取得またはシミュレート生成する
+  Map<String, List<Map<String, dynamic>>> _getActiveHistories() {
+    if (_selectedUser == '\u81ea\u5206') {
+      return {
+        'hp': widget.hpHistory,
+        'mp': widget.mpHistory,
+        'lp': widget.lpHistory,
+      };
+    }
+
+    // 他ユーザーの現在のステータスから逆算してシミュレーションデータを構築
+    final user = widget.otherUsers.firstWhere(
+      (u) => u['name'] == _selectedUser,
+      orElse: () => {
+        'name': _selectedUser,
+        'hp': 80.0,
+        'mp': 80.0,
+        'lp': 80.0,
+      },
+    );
+
+    final double curHP = (user['hp'] as num).toDouble();
+    final double curMP = (user['mp'] as num).toDouble();
+    final double curLP = (user['lp'] as num).toDouble();
+
+    // 過去5時間のエピソード逆算モック
+    final List<Map<String, dynamic>> mockHP = [
+      {'datetime': DateTime.now().subtract(const Duration(hours: 4)), 'episode': '\u5b9a\u6642\u5165\u529b', 'change': 10}, // 「定時入力」
+      {'datetime': DateTime.now().subtract(const Duration(hours: 3)), 'episode': '\u4f5c\u696d\u958b\u59cb', 'change': 5}, // 「作業開始」
+      {'datetime': DateTime.now().subtract(const Duration(hours: 2)), 'episode': '\u663c\u4f11\u307f', 'change': 15}, // 「昼休み」
+      {'datetime': DateTime.now().subtract(const Duration(hours: 1)), 'episode': '\u7dca\u5f35\u306e\u7d2f\u7a4d', 'change': -15}, // 「緊張の累積」
+      {'datetime': DateTime.now(), 'episode': '\u5b9a\u6642\u5165\u529b', 'change': (curHP - 95.0).round()}, // 現在の値に合わせるための調整
+    ];
+
+    final List<Map<String, dynamic>> mockMP = [
+      {'datetime': DateTime.now().subtract(const Duration(hours: 4)), 'episode': '\u5b9a\u6642\u5165\u529b', 'change': 5},
+      {'datetime': DateTime.now().subtract(const Duration(hours: 3)), 'episode': '\u6253\u3061\u5408\u308f\u305b', 'change': -10}, // 「打ち合わせ」
+      {'datetime': DateTime.now().subtract(const Duration(hours: 2)), 'episode': '\u663c\u4f11\u307f', 'change': 10},
+      {'datetime': DateTime.now().subtract(const Duration(hours: 1)), 'episode': '\u75b2\u52b4\u306e\u84c4\u7a4d', 'change': -5}, // 「疲労の蓄積」
+      {'datetime': DateTime.now(), 'episode': '\u5b9a\u6642\u5165\u529b', 'change': (curMP - 80.0).round()},
+    ];
+
+    final List<Map<String, dynamic>> mockLP = [
+      {'datetime': DateTime.now().subtract(const Duration(hours: 4)), 'episode': '\u5b9a\u6642\u5165\u529b', 'change': 10},
+      {'datetime': DateTime.now().subtract(const Duration(hours: 3)), 'episode': '\u4f5c\u696d\u958b\u59cb', 'change': 5},
+      {'datetime': DateTime.now().subtract(const Duration(hours: 2)), 'episode': '\u663c\u4f11\u307f', 'change': 10},
+      {'datetime': DateTime.now().subtract(const Duration(hours: 1)), 'episode': '\u75b2\u52b4\u306e\u84c4\u7a4d', 'change': -10},
+      {'datetime': DateTime.now(), 'episode': '\u5b9a\u6642\u5165\u529b', 'change': (curLP - 95.0).round()},
+    ];
+
+    return {
+      'hp': mockHP,
+      'mp': mockMP,
+      'lp': mockLP,
+    };
+  }
+
+  List<FlSpot> _getSpots(List<Map<String, dynamic>> history, double initialValue) {
+    if (history.isEmpty) {
+      return [
+        const FlSpot(0, 80),
+        const FlSpot(1, 75),
+        const FlSpot(2, 85),
+        const FlSpot(3, 70),
+        const FlSpot(4, 90),
+      ];
+    }
+    final sorted = List<Map<String, dynamic>>.from(history);
+    sorted.sort((a, b) => (a['datetime'] as DateTime).compareTo(b['datetime'] as DateTime));
+    
+    List<FlSpot> spots = [];
+    double currentVal = initialValue;
+    spots.add(FlSpot(0, currentVal));
+    
+    for (int i = 0; i < sorted.length; i++) {
+      final double change = (sorted[i]['change'] as num).toDouble();
+      currentVal = (currentVal + change).clamp(0.0, 100.0);
+      spots.add(FlSpot((i + 1).toDouble(), currentVal));
+    }
+    return spots;
+  }
+
+  String _generateCSV(
+    List<Map<String, dynamic>> hp,
+    List<Map<String, dynamic>> mp,
+    List<Map<String, dynamic>> lp,
+  ) {
+    final List<Map<String, dynamic>> all = [];
+    for (var h in hp) {
+      all.add({...h, 'type': 'HP'});
+    }
+    for (var m in mp) {
+      all.add({...m, 'type': 'MP'});
+    }
+    for (var l in lp) {
+      all.add({...l, 'type': 'LP'});
+    }
+    all.sort((a, b) => (a['datetime'] as DateTime).compareTo(b['datetime'] as DateTime));
+    
+    final StringBuffer buffer = StringBuffer();
+    buffer.writeln('datetime,user,type,episode,change');
+    for (var row in all) {
+      final DateTime dt = row['datetime'] as DateTime;
+      final timeStr = '${dt.year}-${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')} ${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+      buffer.writeln('"$timeStr","$_selectedUser","${row['type']}","${row['episode']}",${row['change']}%');
+    }
+    return buffer.toString();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final histories = _getActiveHistories();
+    final hpList = histories['hp']!;
+    final mpList = histories['mp']!;
+    final lpList = histories['lp']!;
+
+    final hpSpots = _getSpots(hpList, 80.0);
+    final mpSpots = _getSpots(mpList, 80.0);
+    final lpSpots = _getSpots(lpList, 80.0);
+    
+    final csvText = _generateCSV(hpList, mpList, lpList);
+    final bool isSample = hpList.isEmpty && mpList.isEmpty && lpList.isEmpty;
+
+    // ユーザー選択肢リストの作成
+    final List<String> userOptions = [
+      '\u81ea\u5206', // 「自分」
+      ...widget.otherUsers.map((u) => u['name'] as String),
+    ];
+
+    return Scaffold(
+      backgroundColor: Colors.transparent,
+      appBar: AppBar(
+        title: const Text('\u30c7\u30fc\u30bf\u5206\u6790\u30fb\u30a8\u30af\u30b9\u30dd\u30fc\u30c8'), // 「データ分析・エクスポート」
+        centerTitle: true,
+      ),
+      body: Container(
+        width: double.infinity,
+        height: double.infinity,
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [
+              Color(0xFFFFFFFF),
+              Color(0xFFDFFFBF),
+            ],
+          ),
+        ),
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(20.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // ユーザー選択プルダウン（Body最上部）
+              Card(
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                elevation: 3,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Row(
+                        children: [
+                          Icon(Icons.person_search_rounded, color: Colors.blueGrey),
+                          SizedBox(width: 8),
+                          Text(
+                            '\u5bfe\u8c61\u30e5\u30fc\u30b6\u30fc', // 「対象ユーザー」
+                            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+                          ),
+                        ],
+                      ),
+                      DropdownButton<String>(
+                        value: _selectedUser,
+                        icon: const Icon(Icons.arrow_drop_down, color: Colors.blueGrey),
+                        style: const TextStyle(color: Colors.black, fontSize: 14, fontWeight: FontWeight.bold),
+                        underline: Container(height: 1.5, color: Colors.blueGrey),
+                        onChanged: (String? newValue) {
+                          if (newValue != null) {
+                            setState(() {
+                              _selectedUser = newValue;
+                            });
+                          }
+                        },
+                        items: userOptions.map((String user) {
+                          return DropdownMenuItem<String>(
+                            value: user,
+                            child: Text(user),
+                          );
+                        }).toList(),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              
+              // グラフカード
+              Card(
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                elevation: 4,
+                child: Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        '\u30a8\u30cd\u30eb\u30ae\u30fc\u63a8\u79fb\u30b0\u30e9\u30d5 (HP/MP/LP)', // 「エネルギー推移グラフ (HP/MP/LP)」
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.blueGrey,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      if (isSample)
+                        const Text(
+                          '\u203b\u30c7\u30fc\u30bf\u304c\u306a\u3044\u5834\u5408\u306f\u30b5\u30f3\u30d7\u30eb\u63a8\u79fb\u3092\u8868\u793a\u3057\u3066\u3044\u307e\u3059', // 「※データがない場合はサンプル推移を表示しています」
+                          style: TextStyle(fontSize: 11, color: Colors.red),
+                        ),
+                      const SizedBox(height: 20),
+                      SizedBox(
+                        height: 220,
+                        child: LineChart(
+                          LineChartData(
+                            minY: 0,
+                            maxY: 100,
+                            lineBarsData: [
+                              LineChartBarData(
+                                spots: hpSpots,
+                                isCurved: true,
+                                color: Colors.red,
+                                barWidth: 3,
+                                dotData: const FlDotData(show: true),
+                              ),
+                              LineChartBarData(
+                                spots: mpSpots,
+                                isCurved: true,
+                                color: Colors.blue,
+                                barWidth: 3,
+                                dotData: const FlDotData(show: true),
+                              ),
+                              LineChartBarData(
+                                spots: lpSpots,
+                                isCurved: true,
+                                color: Colors.purple,
+                                barWidth: 3,
+                                dotData: const FlDotData(show: true),
+                              ),
+                            ],
+                            titlesData: const FlTitlesData(
+                              rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                              topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          _buildIndicator('HP', Colors.red),
+                          const SizedBox(width: 15),
+                          _buildIndicator('MP', Colors.blue),
+                          const SizedBox(width: 15),
+                          _buildIndicator('LP', Colors.purple),
+                        ],
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 20),
+              
+              // CSV出力カード
+              Card(
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                elevation: 4,
+                child: Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        '\u0043\u0053\u0056\u30a8\u30af\u30b9\u30dd\u30fc\u30c8\u30ed\u30b0', // 「CSVエクスポートログ」
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.blueGrey,
+                        ),
+                      ),
+                      const SizedBox(height: 15),
+                      Container(
+                        width: double.infinity,
+                        constraints: const BoxConstraints(maxHeight: 180),
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: Colors.grey[100],
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: Colors.grey[300]!),
+                        ),
+                        child: SingleChildScrollView(
+                          child: SelectableText(
+                            csvText,
+                            style: const TextStyle(
+                              fontFamily: 'monospace',
+                              fontSize: 11,
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 15),
+                      SizedBox(
+                        width: double.infinity,
+                        child: ElevatedButton.icon(
+                          onPressed: () {
+                            Clipboard.setData(ClipboardData(text: csvText));
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text(
+                                  '\u30af\u30ea\u30c3\u30d7\u30dc\u30fc\u30c9\u306b\u30b3\u30d4\u30fc\u3057\u307e\u3057\u305f', // 「クリップボードにコピーしました」
+                                ),
+                              ),
+                            );
+                          },
+                          icon: const Icon(Icons.copy_rounded, color: Colors.white),
+                          label: const Text(
+                            '\u0043\u0053\u0056\u3092\u30af\u30ea\u30c3\u30d7\u30dc\u30fc\u30c9\u306b\u30b3\u30d4\u30fc', // 「CSVをクリップボードにコピー」
+                            style: TextStyle(fontWeight: FontWeight.bold),
+                          ),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.green,
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(vertical: 12),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildIndicator(String text, Color color) {
+    return Row(
+      children: [
+        Container(
+          width: 12,
+          height: 12,
+          decoration: BoxDecoration(
+            color: color,
+            shape: BoxShape.circle,
+          ),
+        ),
+        const SizedBox(width: 6),
+        Text(
+          text,
+          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+        ),
+      ],
+    );
+  }
+}
+
+
+// ============================================================================
+// EpisodeAnalysisPage (要因分析画面。ユーザー一覧切り替え、疲弊要因のインジケータ表示)
+// ============================================================================
+
+class EpisodeAnalysisPage extends StatefulWidget {
+  final List<Map<String, dynamic>> hpHistory;
+  final List<Map<String, dynamic>> otherUsers;
+
+  const EpisodeAnalysisPage({
+    super.key,
+    required this.hpHistory,
+    required this.otherUsers,
+  });
+
+  @override
+  State<EpisodeAnalysisPage> createState() => _EpisodeAnalysisPageState();
+}
+
+class _EpisodeAnalysisPageState extends State<EpisodeAnalysisPage> {
+  String _selectedUser = '\u81ea\u5206'; // 「自分」
+
+  Map<String, int> _getAnalysisData() {
+    if (_selectedUser == '\u81ea\u5206') {
+      final Map<String, int> counts = {};
+      for (var history in widget.hpHistory) {
+        final double change = (history['change'] as num).toDouble();
+        if (change < 0) {
+          final String ep = history['episode'] as String;
+          counts[ep] = (counts[ep] ?? 0) + 1;
+        }
+      }
+      if (counts.isEmpty) {
+        counts['\u6b8b\u696d'] = 4; // 残業
+        counts['\u7761\u7720\u4e0d\u8db3'] = 3; // 睡眠不足
+        counts['\u982d\u75db'] = 2; // 頭痛
+      }
+      return counts;
+    } else if (_selectedUser.contains('\u7530\u4e2d')) { // 田中 太郎
+      return {
+        '\u6b8b\u696d': 6, // 残業
+        '\u9832\u307f\u904e\u304e': 3, // 飲み過ぎ
+        '\u7761\u7720\u4e0d\u8db3': 2, // 睡眠不足
+      };
+    } else if (_selectedUser.contains('\u4f50\u85e4')) { // 佐藤 花子
+      return {
+        '\u4f1a\u8b70\u75b2\u308c': 5, // 会議疲れ
+        '\u982d\u75db': 3, // 頭痛
+        '\u76ee\u306e\u75b2\u308c': 2, // 目の疲れ
+      };
+    } else if (_selectedUser.contains('\u9234\u6728')) { // 鈴木 一郎
+      return {
+        '\u529b\u4ed5\u4e8b': 7, // 力仕事
+        '\u7b4b\u8089\u75db': 4, // 筋肉痛
+        '\u6e80\u54e1\u96fb\u8eca': 2, // 満員電車
+      };
+    } else {
+      return {
+        '\u6b8b\u696d': 3,
+        '\u76ee\u306e\u75b2\u308c': 2,
+      };
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final counts = _getAnalysisData();
+    final List<String> userOptions = [
+      '\u81ea\u5206', // 「自分」
+      ...widget.otherUsers.map((u) => u['name'] as String),
+    ];
+
+    final int maxVal = counts.values.isEmpty
+        ? 1
+        : counts.values.reduce((curr, next) => curr > next ? curr : next);
+
+    return Scaffold(
+      backgroundColor: Colors.transparent,
+      appBar: AppBar(
+        title: const Text('\u8981\u56e0\u5206\u6790'), // 「要因分析」
+        centerTitle: true,
+      ),
+      body: Container(
+        width: double.infinity,
+        height: double.infinity,
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [
+              Color(0xFFFFFFFF),
+              Color(0xFFDFFFBF),
+            ],
+          ),
+        ),
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(20.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // ユーザー選択カード
+              Card(
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                elevation: 3,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Row(
+                        children: [
+                          Icon(Icons.person_search_rounded, color: Colors.blueGrey),
+                          SizedBox(width: 8),
+                          Text(
+                            '\u5bfe\u8c61\u30e5\u30fc\u30b6\u30fc', // 「対象ユーザー」
+                            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+                          ),
+                        ],
+                      ),
+                      DropdownButton<String>(
+                        value: _selectedUser,
+                        icon: const Icon(Icons.arrow_drop_down, color: Colors.blueGrey),
+                        style: const TextStyle(color: Colors.black, fontSize: 14, fontWeight: FontWeight.bold),
+                        underline: Container(height: 1.5, color: Colors.blueGrey),
+                        onChanged: (String? newValue) {
+                          if (newValue != null) {
+                            setState(() {
+                              _selectedUser = newValue;
+                            });
+                          }
+                        },
+                        items: userOptions.map((String user) {
+                          return DropdownMenuItem<String>(
+                            value: user,
+                            child: Text(user),
+                          );
+                        }).toList(),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(height: 20),
+              
+              // 分析詳細カード
+              Card(
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                elevation: 4,
+                child: Padding(
+                  padding: const EdgeInsets.all(20.0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        '\u4e0d\u8abf\u306e\u4e3b\u8981\u539f\u56e0\u0020\u0028\u75b2\u5f0a\u8981\u56e0\u306e\u5206\u6795\u0029', // 「不調の主要原因 (疲弊要因の分析)」
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.blueGrey,
+                        ),
+                      ),
+                      const SizedBox(height: 24),
+                      ...counts.entries.map((entry) {
+                        return Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 12),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                children: [
+                                  Text(
+                                    entry.key,
+                                    style: const TextStyle(
+                                      fontSize: 14,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                  Text(
+                                    '${entry.value} \u56de', // 「回」
+                                    style: const TextStyle(
+                                      fontSize: 13,
+                                      fontWeight: FontWeight.bold,
+                                      color: Colors.purple,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 8),
+                              LinearProgressIndicator(
+                                value: entry.value / maxVal.toDouble(),
+                                backgroundColor: Colors.grey[200],
+                                color: Colors.purple,
+                                minHeight: 12,
+                                borderRadius: BorderRadius.circular(6),
+                              ),
+                            ],
+                          ),
+                        );
+                      }),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 }

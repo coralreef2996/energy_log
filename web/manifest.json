@@ -1,6 +1,6 @@
 {
-    "name": "体力表示",
-    "short_name": "体力表示",
+    "name": "体調記録",
+    "short_name": "体調記録",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",
